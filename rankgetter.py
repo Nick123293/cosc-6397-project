@@ -147,7 +147,7 @@ if __name__ == "__main__":
     print(f"Top-1 accuracy: {out['top1_accuracy']:.3f}  |  MRR: {out['mrr']:.3f}  |  Mean rank: {out['mean_rank']:.2f}\n")
 
     # Show first few steps for sanity
-    for s in out["steps"][:8]:
+    for s in out["steps"]:
         # Clean display of tokens (SentencePiece often uses leading spaces)
         t_true = s["true_tok"].replace("▁", " ")
         t_pred = s["pred_tok"].replace("▁", " ")
@@ -156,3 +156,10 @@ if __name__ == "__main__":
         if "topk" in s:
             top_show = ", ".join([f"{tok.replace('▁',' ').strip()!r}:{p:.3f}" for tok, p in s["topk"]])
             print("        topk:", top_show)
+    ranks_array = [s["rank_of_true"] for s in out["steps"]]
+
+    print("\n--- SUMMARY OUTPUT ---")
+    print("Starting input text:")
+    print(repr(out["seed_text"]))
+    print("\nRanks array (in order):")
+    print(ranks_array)
