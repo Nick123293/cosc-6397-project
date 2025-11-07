@@ -15,6 +15,11 @@ model = AutoModelForCausalLM.from_pretrained(
     MODEL_ID, device_map=DEVICE_MAP, torch_dtype=DTYPE
 ).eval()
 
+def read_text_file(path: str) -> str:
+    """Read the full content of a text file."""
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read().strip()
+
 def first_n_words_slice(text: str, n_words: int) -> str:
     """
     Return the substring of 'text' containing exactly the first n words (regex \S+).
@@ -135,10 +140,10 @@ def run_sequence_eval(text: str, seed_words: int = 5, topk_show: int = 0) -> Dic
 
 # ---------------------- Example ----------------------
 if __name__ == "__main__":
-    text = (
-        "The capital of France is Paris. "
-        "It is known for the Eiffel Tower and rich cultural heritage."
-    )
+    file_path = input("Enter the path to your text file: ").strip()
+    text = read_text_file(file_path)
+
+    print(f"\nLoaded text ({len(text)} characters):\n{text[:200]}...\n")
 
     out = run_sequence_eval(text, seed_words=SEED_WORDS, topk_show=5)
 
@@ -147,19 +152,19 @@ if __name__ == "__main__":
     print(f"Top-1 accuracy: {out['top1_accuracy']:.3f}  |  MRR: {out['mrr']:.3f}  |  Mean rank: {out['mean_rank']:.2f}\n")
 
     # Show first few steps for sanity
-    for s in out["steps"]:
-        # Clean display of tokens (SentencePiece often uses leading spaces)
-        t_true = s["true_tok"].replace("▁", " ")
-        t_pred = s["pred_tok"].replace("▁", " ")
-        print(f"[pos {s['pos']:>3}] true={t_true!r:>10}  rank={s['rank_of_true']:>4}  "
-              f"pred={t_pred!r:<10}  p={s['pred_p']:.4f}")
-        if "topk" in s:
-            top_show = ", ".join([f"{tok.replace('▁',' ').strip()!r}:{p:.3f}" for tok, p in s["topk"]])
-            print("        topk:", top_show)
+    # for s in out["steps"]:
+    #     # Clean display of tokens (SentencePiece often uses leading spaces)
+    #     t_true = s["true_tok"].replace("▁", " ")
+    #     t_pred = s["pred_tok"].replace("▁", " ")
+    #     print(f"[pos {s['pos']:>3}] true={t_true!r:>10}  rank={s['rank_of_true']:>4}  "
+    #           f"pred={t_pred!r:<10}  p={s['pred_p']:.4f}")
+    #     if "topk" in s:
+    #         top_show = ", ".join([f"{tok.replace('▁',' ').strip()!r}:{p:.3f}" for tok, p in s["topk"]])
+    #         print("        topk:", top_show)
     ranks_array = [s["rank_of_true"] for s in out["steps"]]
 
     print("\n--- SUMMARY OUTPUT ---")
     print("Starting input text:")
     print(repr(out["seed_text"]))
     print("\nRanks array (in order):")
-    print(ranks_array)
+    print(len(ranks_array))
