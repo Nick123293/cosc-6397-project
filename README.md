@@ -7,3 +7,5 @@ To-Do:
 3) Implement decompression model for using ranks to get back words
 4) Find compression ratio, get bitrate
 5) Write report
+
+Compression ratio with huffman encoding on a 128kB file is 5.913
