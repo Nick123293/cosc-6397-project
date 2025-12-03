@@ -137,7 +137,7 @@ def choose_dtype(device):
 
 def read_text_file(path):
     with open(path,"r",encoding="utf-8") as f:
-        return f.read().strip()
+        return f.read()
 
 
 def first_n_words_slice(text, n_words):
