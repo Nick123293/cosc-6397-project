@@ -5,6 +5,7 @@ import os
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from tqdm import tqdm
+import time
 
 # ---------------------- Config defaults ----------------------
 DEFAULT_MODEL_ID = "meta-llama/Llama-3.2-1B"
@@ -172,7 +173,7 @@ def main():
         help="Optional path to write JSON summary",
     )
     args = parser.parse_args()
-
+    start_time = time.perf_counter()
     device = choose_device()
     dtype = choose_dtype(device)
     print(f"Using device: {device}, dtype: {dtype}")
@@ -190,10 +191,12 @@ def main():
         dtype=dtype,
         summary_json=args.summary_json,
     )
-
+    end_time = time.perf_counter()
     print(f"Decoding complete. Total tokens written: {total_tokens}")
     if args.summary_json:
         print(f"Summary JSON saved to: {args.summary_json}")
+    print(f"Total runtime: {end_time - start_time:.2f} seconds")
+
 
 if __name__ == "__main__":
     main()
