@@ -22,9 +22,8 @@ print(f"Compressed State (Integer): {encoded_state}")
 
 # ---------------------------------------------------------
 # To send this to decompressor.py, you need to save:
-# A. The Encoded State
-# B. The Frequency Table (Decoder needs this to reconstruct probabilities)
-# C. The Length of the message
+
+
 # ---------------------------------------------------------
 
 # 5. Decode (What needs to happen before decompressor.py runs)
