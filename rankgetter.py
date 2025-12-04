@@ -2,6 +2,7 @@ import re
 from typing import List, Dict, Any
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
+import sys
 
 # ---------------------- Config ----------------------
 MODEL_ID = "meta-llama/Llama-3.2-1B"   # or "meta-llama/Llama-3.2-3B"
@@ -10,10 +11,17 @@ DEVICE_MAP = "auto"                     # "cuda", "cpu", or "auto"
 DTYPE = torch.bfloat16                  # float16 on GPU is fine too
 
 # ---------------------- Load ------------------------
-tok = AutoTokenizer.from_pretrained(MODEL_ID, use_fast=True)
-model = AutoModelForCausalLM.from_pretrained(
-    MODEL_ID, device_map=DEVICE_MAP, torch_dtype=DTYPE
-).eval()
+print(f"Loading model: {MODEL_ID}...")
+try:
+    tok = AutoTokenizer.from_pretrained(MODEL_ID, use_fast=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL_ID, device_map=DEVICE_MAP, torch_dtype=DTYPE
+    ).eval()
+    print("Model loaded successfully.")
+except Exception as e:
+    print(f"\nCRITICAL ERROR: Could not load model. Error details: {e}")
+    print("If you see 'No module named transformers', run: pip install transformers torch")
+    sys.exit(1)
 
 def read_text_file(path: str) -> str:
     """Read the full content of a text file."""
