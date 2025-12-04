@@ -17,6 +17,11 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 DEFAULT_MODEL_ID = "meta-llama/Llama-3.2-1B"
 DEFAULT_SEED_WORDS = 5
 FLUSH_EVERY = 1048576   # ranks buffered before writing to tmp file
+CODE_BITS = 32
+TOP = (1 << CODE_BITS) - 1
+FIRST_QTR = TOP // 4 + 1
+HALF = 2 * FIRST_QTR
+THIRD_QTR = 3 * FIRST_QTR
 
 
 # ============================================================
@@ -33,6 +38,58 @@ class HuffmanNode:
     def __lt__(self, other):
         return self.freq < other.freq
 
+
+class ArithmeticEncoder:
+    def __init__(self):
+        self.low = 0
+        self.high = TOP
+        self.bits_to_follow = 0
+        self.bits = []  # type: List[int]
+
+    def _output_bit_plus_follow(self, bit: int):
+        self.bits.append(bit)
+        inv = 1 - bit
+        for _ in range(self.bits_to_follow):
+            self.bits.append(inv)
+        self.bits_to_follow = 0
+
+    def encode_symbol(self, symbol_idx: int, cum_freq: List[int], total: int):
+        low = self.low
+        high = self.high
+        range_ = high - low + 1
+
+        sym_low = cum_freq[symbol_idx]
+        sym_high = cum_freq[symbol_idx + 1]
+
+        self.high = low + (range_ * sym_high) // total - 1
+        self.low = low + (range_ * sym_low) // total
+
+        # Renormalization (E1, E2, E3 cases)
+        while True:
+            if self.high < HALF:
+                self._output_bit_plus_follow(0)
+            elif self.low >= HALF:
+                self._output_bit_plus_follow(1)
+                self.low -= HALF
+                self.high -= HALF
+            elif self.low >= FIRST_QTR and self.high < THIRD_QTR:
+                self.bits_to_follow += 1
+                self.low -= FIRST_QTR
+                self.high -= FIRST_QTR
+            else:
+                break
+
+            self.low <<= 1
+            self.high = (self.high << 1) + 1
+
+    def finish(self) -> List[int]:
+        # Emit final bits
+        self.bits_to_follow += 1
+        if self.low < FIRST_QTR:
+            self._output_bit_plus_follow(0)
+        else:
+            self._output_bit_plus_follow(1)
+        return self.bits
 
 def build_huffman_codebook(freqs: Dict[int,int]) -> Dict[int,str]:
     heap = []
@@ -62,6 +119,19 @@ def build_huffman_codebook(freqs: Dict[int,int]) -> Dict[int,str]:
     walk(root, "")
     return codebook
 
+def build_cumulative_freq(rank_freq: Dict[int, int]):
+    """
+    From {rank: freq} build:
+      - symbols: sorted list of ranks
+      - cum_freq: list such that cum_freq[i] is sum of freqs for symbols[:i]
+      - total: total number of ranks
+    """
+    symbols = sorted(rank_freq.keys())
+    cum_freq = [0]
+    for r in symbols:
+        cum_freq.append(cum_freq[-1] + rank_freq[r])
+    total = cum_freq[-1]
+    return symbols, cum_freq, total
 
 def write_combined_huffman_file(
     seed_text: str,
@@ -121,6 +191,63 @@ def write_combined_huffman_file(
         bf.write(struct.pack("B", padding))            # padding used
         bf.write(data_bytes)
 
+
+def write_combined_arithmetic_file(
+    seed_text: str,
+    rank_freq: Dict[int, int],
+    ranks_file: str,
+    output_bin: str,
+):
+    """
+    Writes one binary file containing:
+      seed text
+      frequency table
+      arithmetic-coded bitstream of ranks
+    """
+    # Build cumulative distribution over ranks
+    symbols, cum_freq, total = build_cumulative_freq(rank_freq)
+    symbol_to_idx = {r: i for i, r in enumerate(symbols)}
+
+    # Encode ranks (skip first line = seed)
+    encoder = ArithmeticEncoder()
+    with open(ranks_file, "r", encoding="utf-8") as f:
+        next(f)  # skip seed line
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            rk = int(line)
+            idx = symbol_to_idx[rk]
+            encoder.encode_symbol(idx, cum_freq, total)
+
+    bits = encoder.finish()
+
+    # Convert bits -> bytes with padding
+    bitstring = "".join("1" if b else "0" for b in bits)
+    padding = (8 - (len(bitstring) % 8)) % 8
+    bitstring += "0" * padding
+
+    data_bytes = bytes(
+        int(bitstring[i:i + 8], 2) for i in range(0, len(bitstring), 8)
+    )
+
+    import struct
+
+    with open(output_bin, "wb") as bf:
+        # 1) Seed text
+        seed_bytes = seed_text.encode("utf-8")
+        bf.write(struct.pack(">I", len(seed_bytes)))
+        bf.write(seed_bytes)
+
+        # 2) Frequency table
+        bf.write(struct.pack(">I", len(symbols)))  # number of distinct ranks
+        for r in symbols:
+            freq = rank_freq[r]
+            bf.write(struct.pack(">II", r, freq))   # rank, freq
+
+        # 3) Encoded data
+        bf.write(struct.pack("B", padding))        # padding bits at end
+        bf.write(data_bytes)
 
 # ============================================================
 # ---------------------- MODEL UTILS -------------------------
@@ -318,6 +445,7 @@ def main():
     parser.add_argument("--model-id", default=DEFAULT_MODEL_ID)
     parser.add_argument("--seed-words", type=int, default=DEFAULT_SEED_WORDS)
     parser.add_argument("--huffman-encoding", action="store_true")
+    parser.add_argument("--arith-encoding", action="store_true")
     parser.add_argument("--keep-intermediate", action="store_true")
     args = parser.parse_args()
     start_time = time.perf_counter()
@@ -340,26 +468,61 @@ def main():
         seed_words=args.seed_words,
     )
 
-    if not args.huffman_encoding:
+    # if not args.huffman_encoding:
+    #     print(f"Ranks written to {tmp_ranks}")
+    #     return
+
+    # # Build Huffman codebook
+    # codebook = build_huffman_codebook(rank_freq)
+
+    # # Build final output file
+    # write_combined_huffman_file(
+    #     seed_text=seed_text,
+    #     codebook=codebook,
+    #     ranks_file=tmp_ranks,
+    #     output_bin=args.output,
+    # )
+
+    # if not args.keep_intermediate:
+    #     os.remove(tmp_ranks)
+    # end_time = time.perf_counter()
+    # print(f"Huffman-encoded combined file saved to {args.output}")
+    # print(f"Total runtime: {end_time - start_time:.2f} seconds")
+
+    if not args.huffman_encoding and not args.arith_encoding:
         print(f"Ranks written to {tmp_ranks}")
         return
 
-    # Build Huffman codebook
-    codebook = build_huffman_codebook(rank_freq)
+    # Don't allow both at once
+    if args.huffman_encoding and args.arith_encoding:
+        raise ValueError("Choose only one of --huffman-encoding or --arith-encoding")
 
-    # Build final output file
-    write_combined_huffman_file(
-        seed_text=seed_text,
-        codebook=codebook,
-        ranks_file=tmp_ranks,
-        output_bin=args.output,
-    )
+    if args.huffman_encoding:
+        # Build Huffman codebook
+        codebook = build_huffman_codebook(rank_freq)
+
+        # Build final output file (Huffman)
+        write_combined_huffman_file(
+            seed_text=seed_text,
+            codebook=codebook,
+            ranks_file=tmp_ranks,
+            output_bin=args.output,
+        )
+        scheme = "Huffman"
+    else:
+        # Arithmetic coding path
+        write_combined_arithmetic_file(
+            seed_text=seed_text,
+            rank_freq=rank_freq,
+            ranks_file=tmp_ranks,
+            output_bin=args.output,
+        )
+        scheme = "arithmetic"
 
     if not args.keep_intermediate:
         os.remove(tmp_ranks)
-    end_time = time.perf_counter()
-    print(f"Huffman-encoded combined file saved to {args.output}")
-    print(f"Total runtime: {end_time - start_time:.2f} seconds")
+
+    print(f"{scheme} encoded combined file saved to {args.output}")
 
 if __name__ == "__main__":
     main()
