@@ -15,7 +15,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 # ---------------------- Config ----------------------
 DEFAULT_MODEL_ID = "meta-llama/Llama-3.2-1B"
 DEFAULT_SEED_WORDS = 5
-FLUSH_EVERY = 10000   # ranks buffered before writing to tmp file
+FLUSH_EVERY = 1048576   # ranks buffered before writing to tmp file
 
 
 # ============================================================
@@ -158,18 +158,27 @@ def token_rank(prob_vector, true_token_id):
 # ============================================================
 
 def run_sequence_eval_streaming(text, tok, model, tmp_ranks_path, seed_words):
+    """
+    Compute ranks for the given text (streaming, using KV cache),
+    write them to tmp_ranks_path, and ALSO do a short self-decode
+    using the same model/tokenizer to verify correctness.
+
+    If the self-decode diverges, you'll see a printed mismatch.
+    """
 
     device = model.device
 
+    # Full tokenization of the text
     full = tok(text, return_tensors="pt")
     full_ids = full["input_ids"].to(device)
     T = full_ids.shape[1]
 
+    # Seed text and its tokenization
     seed_text = first_n_words_slice(text, seed_words)
     seed_ids = tok(seed_text, return_tensors="pt")["input_ids"].to(device)
     L0 = seed_ids.shape[1]
 
-    # Warm-up
+    # Initial forward pass on the seed to get KV cache
     with torch.inference_mode():
         out = model(input_ids=seed_ids, use_cache=True)
         past = out.past_key_values
@@ -177,35 +186,124 @@ def run_sequence_eval_streaming(text, tok, model, tmp_ranks_path, seed_words):
     rank_freq = defaultdict(int)
     buffer = []
 
-    with open(tmp_ranks_path, "w") as f:
+    # ---- for self-decode debugging ----
+    SELF_DECODE_TOKENS = 1000  # how many tokens *after the seed* to test
+    debug_ranks = []          # first N ranks we'll self-decode
+    # -----------------------------------
+
+    with open(tmp_ranks_path, "w", encoding="utf-8") as f:
         f.write(seed_text + "\n")
 
         for pos in range(L0, T):
-
-            true_id = int(full_ids[0,pos])
+            true_id = int(full_ids[0, pos])
 
             with torch.inference_mode():
+                # one-step incremental forward: previous token only
+                step_input = full_ids[:, pos - 1:pos]  # shape (1,1)
                 out = model(
-                    input_ids=full_ids[:, pos-1:pos],
+                    input_ids=step_input,
                     past_key_values=past,
                     use_cache=True
                 )
                 past = out.past_key_values
 
-            probs = torch.softmax(out.logits[:, -1, :], dim=-1)[0]
-            rk = token_rank(probs, true_id)
+                logits = out.logits[0, -1, :]  # shape [vocab_size]
+
+                # ---- rank definition consistent with decoder ----
+                # Rank = 1-based index of true_id in argsort(logits, descending=True)
+                sorted_ids = torch.argsort(logits, descending=True)
+                true_pos = (sorted_ids == true_id).nonzero(as_tuple=False)
+                if true_pos.numel() == 0:
+                    raise RuntimeError("True token id not found in sorted_ids (should never happen)")
+                rk = int(true_pos.item()) + 1
+                # -----------------------------------------------
 
             rank_freq[rk] += 1
             buffer.append(rk)
 
+            # Keep the first SELF_DECODE_TOKENS ranks for self-check
+            if len(debug_ranks) < SELF_DECODE_TOKENS:
+                debug_ranks.append(rk)
+
             if len(buffer) >= FLUSH_EVERY:
-                for r in buffer: f.write(f"{r}\n")
+                for r in buffer:
+                    f.write(f"{r}\n")
                 buffer.clear()
 
         # final flush
-        for r in buffer: f.write(f"{r}\n")
+        for r in buffer:
+            f.write(f"{r}\n")
+
+    # ============================================================
+    # ---------------------- SELF-DECODE -------------------------
+    # ============================================================
+    if debug_ranks:
+        print(f"[SELF-DECODE] Checking first {len(debug_ranks)} tokens after seed...")
+
+        with torch.inference_mode():
+            # Re-run seed to get fresh KV cache
+            seed_ids = tok(seed_text, return_tensors="pt")["input_ids"].to(device)
+            out = model(seed_ids, use_cache=True)
+            past = out.past_key_values
+
+            decoded_ids = seed_ids[0].tolist()
+            last_token_id = decoded_ids[-1]
+
+            # Preallocate a 1x1 tensor for incremental input_ids
+            step_ids = torch.empty(1, 1, dtype=torch.long, device=device)
+
+            for rk in debug_ranks:
+                step_ids[0, 0] = last_token_id
+                out = model(
+                    step_ids,
+                    use_cache=True,
+                    past_key_values=past,
+                )
+                past = out.past_key_values
+                last_logits = out.logits[0, -1, :]
+
+                # Interpret rank the same way as above:
+                # position in logits-sorted-descending
+                sorted_ids = torch.argsort(last_logits, descending=True)
+                next_token_id = int(sorted_ids[rk - 1].item())
+
+                decoded_ids.append(next_token_id)
+                last_token_id = next_token_id
+
+        # Compare decoded prefix to ground truth full_ids
+        compare_len = len(decoded_ids)
+        orig_slice = full_ids[0, :compare_len].tolist()
+
+        if decoded_ids == orig_slice:
+            print(f"[SELF-DECODE] OK: first {compare_len - L0} tokens after seed match ground truth.")
+        else:
+            # Find first mismatch
+            mismatch_pos = None
+            for i, (a, b) in enumerate(zip(decoded_ids, orig_slice)):
+                if a != b:
+                    mismatch_pos = i
+                    break
+
+            print("[SELF-DECODE] MISMATCH detected!")
+            print(f"  First mismatch at token index {mismatch_pos} (0-based, in token space).")
+            print(f"  Seed length (L0) = {L0}")
+            if mismatch_pos is not None:
+                print(f"  This is token {mismatch_pos - L0} after the seed.")
+                print(f"  orig_id = {orig_slice[mismatch_pos]}, dec_id = {decoded_ids[mismatch_pos]}")
+
+            # Optional: show a short text snippet around the mismatch
+            try:
+                orig_text_snip = tok.decode(orig_slice[max(0, mismatch_pos-10):mismatch_pos+10])
+                dec_text_snip = tok.decode(decoded_ids[max(0, mismatch_pos-10):mismatch_pos+10])
+                print("  Original context snippet:")
+                print("  ", repr(orig_text_snip))
+                print("  Decoded  context snippet:")
+                print("  ", repr(dec_text_snip))
+            except Exception as e:
+                print(f"  (Could not decode snippet for inspection: {e})")
 
     return seed_text, rank_freq
+
 
 
 # ============================================================
@@ -225,8 +323,8 @@ def main():
     device = choose_device()
     dtype = choose_dtype(device)
 
-    tok = AutoTokenizer.from_pretrained(args.model_id, use_fast=True)
-    model = AutoModelForCausalLM.from_pretrained(args.model_id, torch_dtype=dtype).to(device)
+    tok = AutoTokenizer.from_pretrained(args.model_id, use_fast=True, revision="main")
+    model = AutoModelForCausalLM.from_pretrained(args.model_id, dtype=dtype).to(device)
     model.eval()
 
     text = read_text_file(args.input)

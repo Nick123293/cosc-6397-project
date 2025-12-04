@@ -47,15 +47,13 @@ def load_model_and_tokenizer(model_id: str, device: torch.device, dtype: torch.d
     # Suppress tokenizer parallelism warning
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-    tok = AutoTokenizer.from_pretrained(model_id, use_fast=True)
+    tok = AutoTokenizer.from_pretrained(model_id, use_fast=True, revision="main")
 
     # low_cpu_mem_usage avoids some extra copies when loading
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
-        torch_dtype=dtype,
-        low_cpu_mem_usage=True,
-    )
-    model.to(device)
+        dtype=dtype,
+    ).to(device)
     model.eval()
 
     return tok, model
@@ -70,12 +68,6 @@ def decode_from_ranks_streaming(
     dtype=None,
     summary_json=None,
 ):
-    """
-    More efficient decoding:
-      - First pass: run the seed once to initialize KV cache.
-      - Then: incremental decoding, feeding only the last token each step.
-      - Use logits rankings directly (no softmax) + topk instead of full argsort.
-    """
     device = device or choose_device()
     dtype = dtype or choose_dtype(device)
 
@@ -89,37 +81,32 @@ def decode_from_ranks_streaming(
     with torch.inference_mode():
         # Initial forward pass on the full seed to get cache
         outputs = model(seed_ids, use_cache=True)
-        logits = outputs.logits
         past_key_values = outputs.past_key_values
 
         # Last token from the seed (for next step)
         last_token_id = decoded_ids[-1]
 
+        # Preallocate a 1x1 tensor for incremental input_ids (matches self-decode)
+        step_ids = torch.empty(1, 1, dtype=torch.long, device=device)
+
         # Open output file and write the seed text up front
         with open(output_file, "w", encoding="utf-8") as f_out:
-            # Keep same behavior as your original script:
-            # write seed_text exactly as provided, plus a space, then generated tokens.
             f_out.write(seed_text)
 
-            # Optional: small buffer for text to reduce I/O calls
             text_buffer = []
 
-            # Main decoding loop
             for rank in tqdm(ranks, desc="Decoding tokens"):
-                # Prepare input with only the last token
-                input_ids = torch.tensor([[last_token_id]], device=device)
+                # Prepare input with only the last token, in-place
+                step_ids[0, 0] = last_token_id
 
                 # Incremental forward using past_key_values (KV cache)
                 outputs = model(
-                    input_ids,
+                    step_ids,
                     use_cache=True,
                     past_key_values=past_key_values,
                 )
-                logits = outputs.logits
                 past_key_values = outputs.past_key_values
-
-                # Get logits for next token (no softmax needed for ranking)
-                last_logits = logits[0, -1, :]
+                last_logits = outputs.logits[0, -1, :]
 
                 # Ensure rank is valid
                 vocab_size = last_logits.shape[-1]
@@ -129,24 +116,20 @@ def decode_from_ranks_streaming(
                         f"(must be between 1 and {vocab_size})"
                     )
 
-                # Use topk instead of full argsort
-                # topk_vals, topk_ids = torch.topk(last_logits, k=rank)
-                topk_vals, topk_ids = torch.topk(last_logits, k=rank)
-                next_token_id = int(topk_ids[rank - 1].item())
+                # **Use argsort, just like the compressor + self-decode**
+                sorted_ids = torch.argsort(last_logits, descending=True)
+                next_token_id = int(sorted_ids[rank - 1].item())
 
                 decoded_ids.append(next_token_id)
                 last_token_id = next_token_id
 
-                # Decode just this token
                 token_str = tok.decode([next_token_id], clean_up_tokenization_spaces=False)
                 text_buffer.append(token_str)
 
-                # Periodically flush buffer to file to keep memory small
                 if len(text_buffer) >= 1024:
                     f_out.write("".join(text_buffer))
                     text_buffer = []
 
-            # Flush any remaining buffered text
             if text_buffer:
                 f_out.write("".join(text_buffer))
 
