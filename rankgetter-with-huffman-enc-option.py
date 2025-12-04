@@ -521,8 +521,10 @@ def main():
 
     if not args.keep_intermediate:
         os.remove(tmp_ranks)
-
+    end_time = time.perf_counter()
     print(f"{scheme} encoded combined file saved to {args.output}")
+    print(f"Total runtime: {end_time - start_time:.2f} seconds")
+
 
 if __name__ == "__main__":
     main()
