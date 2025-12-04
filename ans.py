@@ -1,64 +1,37 @@
-class rANS:
-    def __init__(self, frequencies):
-        self.freqs = frequencies
-        self.M = sum(frequencies.values()) # Normalization factor
-        
-        # Build Cumulative Distribution Function (CDF)
-        self.cum_freq = {}
-        current = 0
-        for char, freq in frequencies.items():
-            self.cum_freq[char] = current
-            current += freq
-            
-        # Reverse lookup for decoding (slot -> char)
-        self.symbol_map = []
-        for char, freq in frequencies.items():
-            self.symbol_map.extend([char] * freq)
+from collections import Counter
+import json
+# Import the class from your file
+from ans import rANS 
 
-    def encode(self, message):
-        state = 0 # Start with state 0 usually implies an empty buffer, 
-                  # but usually initialized to a lower bound in streaming.
-                  # For this math demo, we start at a base offset to avoid x=0 issues.
-        state = 1 
-        
-        for char in message:
-            fs = self.freqs[char]
-            cs = self.cum_freq[char]
-            
-            # The rANS Encoding Formula
-            state = (state // fs) * self.M + cs + (state % fs)
-            
-        return state
+# 1. Simulate output from rankgetter.py
+# In reality, you would get this list from rankgetter's "ranks_array"
+ranks_from_llm = [1, 1, 2, 1, 5, 1, 1, 3, 10, 1] 
 
-    def decode(self, final_state, length):
-        state = final_state
-        decoded_message = []
-        
-        for _ in range(length):
-            # 1. Find the symbol based on modulo M
-            slot = state % self.M
-            char = self.symbol_map[slot]
-            
-            # 2. Retrieve Frequency and Cumulative Frequency
-            fs = self.freqs[char]
-            cs = self.cum_freq[char]
-            
-            # 3. Update State (Inverse of Encoding)
-            state = fs * (state // self.M) + slot - cs
-            
-            decoded_message.append(char)
-            
-        return "".join(reversed(decoded_message)) # LIFO structure
+# 2. Build the Frequency Table (The Missing Link)
+# We must count how often each rank appears to build the probability model
+freqs = Counter(ranks_from_llm)
 
-# --- Usage ---
-# Frequencies must be known by both encoder and decoder
-freqs = {'A': 3, 'B': 1, 'C': 1} # A is very common
+# 3. Initialize rANS with integer keys
 rans = rANS(freqs)
 
-original = "ABACABA"
-encoded_state = rans.encode(original)
-decoded = rans.decode(encoded_state, len(original))
+# 4. Encode
+# Note: We pass the list of integers, not a string
+encoded_state = rans.encode(ranks_from_llm)
 
-print(f"Original: {original}")
-print(f"State Integer: {encoded_state}")
-print(f"Decoded:  {decoded}")
+print(f"Compressed State (Integer): {encoded_state}")
+
+# ---------------------------------------------------------
+# To send this to decompressor.py, you need to save:
+# A. The Encoded State
+# B. The Frequency Table (Decoder needs this to reconstruct probabilities)
+# C. The Length of the message
+# ---------------------------------------------------------
+
+# 5. Decode (What needs to happen before decompressor.py runs)
+decoded_ranks = rans.decode(encoded_state, len(ranks_from_llm))
+
+print(f"Decoded Ranks: {decoded_ranks}")
+
+# Verify exact match
+assert ranks_from_llm == list(decoded_ranks)
+print("Success: rANS encoded and decoded the LLM ranks.")
