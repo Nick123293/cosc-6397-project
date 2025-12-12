@@ -129,58 +129,110 @@ def decode_from_ranks_streaming(
     model_id: str,
     device=None,
     dtype=None,
+    summary_json=None,
 ):
+    """
+    Decode using the SAME sliding-window context scheme as the compressor.
+
+    For each rank r_k:
+      - Take up to max_ctx previous decoded tokens as context
+      - Run a full forward pass over that window (no KV cache)
+      - Sort logits of the last position
+      - Choose the token whose rank is r_k in that sorted list
+    """
+
     device = device or choose_device()
     dtype = dtype or choose_dtype(device)
 
     tok, model = load_model_and_tokenizer(model_id, device, dtype)
+    model.eval()
 
-    seed_ids = tok(seed_text, return_tensors="pt").input_ids.to(device)
+    # ---------------------------
+    # Determine max context length
+    # ---------------------------
+    cfg = getattr(model, "config", None)
+    max_ctx = None
+    if cfg is not None:
+        max_ctx = getattr(cfg, "n_positions", None)
+        if max_ctx is None:
+            max_ctx = getattr(cfg, "max_position_embeddings", None)
+    if max_ctx is None:
+        max_ctx = 1024  # safe default (must match compressor's fallback)
+
+    # ---------------------------
+    # Tokenize seed and initialize decoded_ids
+    # ---------------------------
+    seed_ids = tok(seed_text, return_tensors="pt")["input_ids"].to(device)
     decoded_ids = seed_ids[0].tolist()
+    decoded_ids_sample = decoded_ids[:20]  # for summary
 
-    with torch.inference_mode():
-        outputs = model(seed_ids, use_cache=True)
-        past_key_values = outputs.past_key_values
+    # ---------------------------
+    # Open output file and write initial seed text
+    # ---------------------------
+    with open(output_file, "w", encoding="utf-8") as f_out:
+        f_out.write(seed_text)
 
-        last_token_id = decoded_ids[-1]
-        step_ids = torch.empty(1, 1, dtype=torch.long, device=device)
+        text_buffer = []
 
-        with open(output_file, "w", encoding="utf-8") as f_out:
-            f_out.write(seed_text)
-            text_buffer = []
+        for rank in tqdm(ranks, desc="Decoding tokens"):
+            # Build context: last up to max_ctx tokens
+            if len(decoded_ids) <= max_ctx:
+                ctx_slice = decoded_ids
+            else:
+                ctx_slice = decoded_ids[-max_ctx:]
 
-            for rank in tqdm(ranks, desc="Decoding tokens"):
-                step_ids[0, 0] = last_token_id
+            context_ids = torch.tensor(
+                ctx_slice, dtype=torch.long, device=device
+            ).unsqueeze(0)  # shape: (1, <=max_ctx)
 
-                outputs = model(
-                    step_ids,
-                    use_cache=True,
-                    past_key_values=past_key_values,
-                )
-                past_key_values = outputs.past_key_values
-
+            with torch.inference_mode():
+                # Fresh forward pass, no KV cache (to mirror compressor)
+                outputs = model(input_ids=context_ids)
                 last_logits = outputs.logits[0, -1, :]
-                vocab_size = last_logits.shape[-1]
-                if not (1 <= rank <= vocab_size):
-                    raise ValueError(f"Rank {rank} is out of bounds for vocab {vocab_size}")
 
-                sorted_ids = torch.argsort(last_logits, descending=True)
-                next_token_id = int(sorted_ids[rank - 1].item())
+            vocab_size = last_logits.shape[-1]
+            if rank < 1 or rank > vocab_size:
+                raise ValueError(
+                    f"Rank {rank} is out of bounds for vocab size {vocab_size} "
+                    f"(must be between 1 and {vocab_size})"
+                )
 
-                decoded_ids.append(next_token_id)
-                last_token_id = next_token_id
+            # Use argsort, just like the compressor
+            sorted_ids = torch.argsort(last_logits, descending=True)
+            next_token_id = int(sorted_ids[rank - 1].item())
 
-                token_str = tok.decode([next_token_id], clean_up_tokenization_spaces=False)
-                text_buffer.append(token_str)
+            decoded_ids.append(next_token_id)
 
-                if len(text_buffer) >= 1024:
-                    f_out.write("".join(text_buffer))
-                    text_buffer = []
+            token_str = tok.decode(
+                [next_token_id],
+                clean_up_tokenization_spaces=False,
+            )
+            text_buffer.append(token_str)
 
-            if text_buffer:
+            # Periodically flush text to disk
+            if len(text_buffer) >= 1024:
                 f_out.write("".join(text_buffer))
+                text_buffer = []
 
-    return len(decoded_ids)
+        # Final flush
+        if text_buffer:
+            f_out.write("".join(text_buffer))
+
+    total_tokens = len(decoded_ids)
+
+    if summary_json is not None:
+        summary = {
+            "seed_text": seed_text,
+            "num_ranks": len(ranks),
+            "total_tokens": total_tokens,
+            "decoded_ids_sample": decoded_ids_sample,
+            "decoded_text_start": seed_text + "...",
+        }
+        with open(summary_json, "w", encoding="utf-8") as f_json:
+            json.dump(summary, f_json, indent=2, ensure_ascii=False)
+
+    return total_tokens
+
 
 
 # ============================================================
