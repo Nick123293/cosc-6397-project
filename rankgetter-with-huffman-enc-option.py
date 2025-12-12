@@ -8,6 +8,7 @@ import heapq
 import os
 import struct
 import time
+import collections # Re-added for explicit usage if needed, though defaultdict covers most
 
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
@@ -22,6 +23,128 @@ TOP = (1 << CODE_BITS) - 1
 FIRST_QTR = TOP // 4 + 1
 HALF = 2 * FIRST_QTR
 THIRD_QTR = 3 * FIRST_QTR
+
+
+# ============================================================
+# ---------------------- RANS LOGIC --------------------------
+# ============================================================
+
+class StreamingrANS:
+    """
+    A Streaming rANS encoder/decoder.
+    Integrated from ans.py
+    """
+    def __init__(self, frequencies):
+        self.L = 1 << 16  # Renormalization lower bound
+        self.M_scale = sum(frequencies.values())
+        self.freqs = frequencies
+        
+        # Build CDF
+        self.cum_freq = {}
+        self.symbol_map = {} 
+        current = 0
+        # Sort keys to ensure deterministic behavior across machines
+        for sym in sorted(frequencies.keys()):
+            f = frequencies[sym]
+            self.cum_freq[sym] = current
+            # Map range to symbol for decoding
+            for i in range(current, current + f):
+                self.symbol_map[i] = sym
+            current += f
+
+    def encode(self, symbols):
+        state = self.L 
+        bit_stream = [] 
+
+        # Encode in reverse (LIFO)
+        for sym in reversed(symbols):
+            freq = self.freqs[sym]
+            start = self.cum_freq[sym]
+
+            # Renormalize to stay within bounds
+            while state >= (self.L * 4): 
+                bit_stream.append(state & 0xFF) 
+                state >>= 8                     
+
+            # Update state
+            state = (state // freq) * self.M_scale + start + (state % freq)
+
+        return state, bytearray(reversed(bit_stream))
+
+    def decode(self, initial_state, stream, num_symbols):
+        state = initial_state
+        stream_iter = iter(stream)
+        decoded = []
+        
+        for _ in range(num_symbols):
+            slot = state % self.M_scale
+            sym = self.symbol_map[slot]
+            
+            freq = self.freqs[sym]
+            start = self.cum_freq[sym]
+            
+            # Decode state
+            state = freq * (state // self.M_scale) + slot - start
+            decoded.append(sym)
+            
+            # Renormalize (pull bytes from stream)
+            while state < self.L:
+                try:
+                    val = next(stream_iter) 
+                    state = (state << 8) | val
+                except StopIteration:
+                    break
+                    
+        return decoded
+
+def write_combined_ans_file(
+    seed_text: str,
+    rank_freq: Dict[int, int],
+    ranks_file: str,
+    output_bin: str
+):
+    """
+    Writes the binary file using the rANS method.
+    Matches the file format expected by the original ans.py loader.
+    """
+    # 1. Read ranks from the temp file
+    # We need the full list in memory to encode in reverse.
+    ranks = []
+    with open(ranks_file, 'r', encoding='utf-8') as f:
+        # First line is seed text, skip it
+        lines = f.readlines()
+        # The first line is the seed text
+        # The rest are ranks
+        for line in lines[1:]:
+            if line.strip():
+                try:
+                    ranks.append(int(line.strip()))
+                except ValueError:
+                    pass
+
+    num_symbols = len(ranks)
+    
+    # 2. Initialize rANS
+    rans = StreamingrANS(rank_freq)
+    
+    # 3. Encode
+    final_state, stream = rans.encode(ranks)
+    
+    # 4. Prepare Metadata (matching ans.py format)
+    metadata = {
+        "seed_text": seed_text,
+        "final_state": final_state,
+        "num_symbols": num_symbols,
+        "frequencies": rank_freq
+    }
+    
+    # 5. Write to File
+    meta_json = json.dumps(metadata).encode('utf-8')
+    
+    with open(output_bin, "wb") as f:
+        f.write(struct.pack("I", len(meta_json))) # 4 bytes for header length
+        f.write(meta_json)                        # Metadata
+        f.write(stream)                           # Compressed Ranks
 
 
 # ============================================================
@@ -290,8 +413,6 @@ def run_sequence_eval_streaming(text, tok, model, tmp_ranks_path, seed_words):
     Compute ranks for the given text (streaming, using KV cache),
     write them to tmp_ranks_path, and ALSO do a short self-decode
     using the same model/tokenizer to verify correctness.
-
-    If the self-decode diverges, you'll see a printed mismatch.
     """
 
     device = model.device
@@ -313,11 +434,6 @@ def run_sequence_eval_streaming(text, tok, model, tmp_ranks_path, seed_words):
 
     rank_freq = defaultdict(int)
     buffer = []
-
-    # # ---- for self-decode debugging ----
-    # SELF_DECODE_TOKENS = 1000  # how many tokens *after the seed* to test
-    # debug_ranks = []          # first N ranks we'll self-decode
-    # # -----------------------------------
 
     with open(tmp_ranks_path, "w", encoding="utf-8") as f:
         f.write(seed_text + "\n")
@@ -349,10 +465,6 @@ def run_sequence_eval_streaming(text, tok, model, tmp_ranks_path, seed_words):
             rank_freq[rk] += 1
             buffer.append(rk)
 
-            # # Keep the first SELF_DECODE_TOKENS ranks for self-check
-            # if len(debug_ranks) < SELF_DECODE_TOKENS:
-            #     debug_ranks.append(rk)
-
             if len(buffer) >= FLUSH_EVERY:
                 for r in buffer:
                     f.write(f"{r}\n")
@@ -361,74 +473,6 @@ def run_sequence_eval_streaming(text, tok, model, tmp_ranks_path, seed_words):
         # final flush
         for r in buffer:
             f.write(f"{r}\n")
-
-    # ============================================================
-    # ---------------------- SELF-DECODE -------------------------
-    # ============================================================
-    # if debug_ranks:
-    #     print(f"[SELF-DECODE] Checking first {len(debug_ranks)} tokens after seed...")
-
-    #     with torch.inference_mode():
-    #         # Re-run seed to get fresh KV cache
-    #         seed_ids = tok(seed_text, return_tensors="pt")["input_ids"].to(device)
-    #         out = model(seed_ids, use_cache=True)
-    #         past = out.past_key_values
-
-    #         decoded_ids = seed_ids[0].tolist()
-    #         last_token_id = decoded_ids[-1]
-
-    #         # Preallocate a 1x1 tensor for incremental input_ids
-    #         step_ids = torch.empty(1, 1, dtype=torch.long, device=device)
-
-    #         for rk in debug_ranks:
-    #             step_ids[0, 0] = last_token_id
-    #             out = model(
-    #                 step_ids,
-    #                 use_cache=True,
-    #                 past_key_values=past,
-    #             )
-    #             past = out.past_key_values
-    #             last_logits = out.logits[0, -1, :]
-
-    #             # Interpret rank the same way as above:
-    #             # position in logits-sorted-descending
-    #             sorted_ids = torch.argsort(last_logits, descending=True)
-    #             next_token_id = int(sorted_ids[rk - 1].item())
-
-    #             decoded_ids.append(next_token_id)
-    #             last_token_id = next_token_id
-
-    #     # Compare decoded prefix to ground truth full_ids
-    #     compare_len = len(decoded_ids)
-    #     orig_slice = full_ids[0, :compare_len].tolist()
-
-    #     if decoded_ids == orig_slice:
-    #         print(f"[SELF-DECODE] OK: first {compare_len - L0} tokens after seed match ground truth.")
-    #     else:
-    #         # Find first mismatch
-    #         mismatch_pos = None
-    #         for i, (a, b) in enumerate(zip(decoded_ids, orig_slice)):
-    #             if a != b:
-    #                 mismatch_pos = i
-    #                 break
-
-    #         print("[SELF-DECODE] MISMATCH detected!")
-    #         print(f"  First mismatch at token index {mismatch_pos} (0-based, in token space).")
-    #         print(f"  Seed length (L0) = {L0}")
-    #         if mismatch_pos is not None:
-    #             print(f"  This is token {mismatch_pos - L0} after the seed.")
-    #             print(f"  orig_id = {orig_slice[mismatch_pos]}, dec_id = {decoded_ids[mismatch_pos]}")
-
-    #         # Optional: show a short text snippet around the mismatch
-    #         try:
-    #             orig_text_snip = tok.decode(orig_slice[max(0, mismatch_pos-10):mismatch_pos+10])
-    #             dec_text_snip = tok.decode(decoded_ids[max(0, mismatch_pos-10):mismatch_pos+10])
-    #             print("  Original context snippet:")
-    #             print("  ", repr(orig_text_snip))
-    #             print("  Decoded  context snippet:")
-    #             print("  ", repr(dec_text_snip))
-    #         except Exception as e:
-    #             print(f"  (Could not decode snippet for inspection: {e})")
 
     return seed_text, rank_freq
 
@@ -444,9 +488,11 @@ def main():
     parser.add_argument("output")
     parser.add_argument("--model-id", default=DEFAULT_MODEL_ID)
     parser.add_argument("--seed-words", type=int, default=DEFAULT_SEED_WORDS)
-    parser.add_argument("--huffman-encoding", action="store_true")
-    parser.add_argument("--arith-encoding", action="store_true")
-    parser.add_argument("--keep-intermediate", action="store_true")
+    parser.add_argument("--huffman-encoding", action="store_true", help="Use Huffman encoding")
+    parser.add_argument("--arith-encoding", action="store_true", help="Use Arithmetic encoding")
+    parser.add_argument("--ans-encoding", action="store_true", help="Use rANS encoding (integrated from ans.py)")
+    parser.add_argument("--keep-intermediate", action="store_true", help="Keep the intermediate .ranks.txt file")
+    
     args = parser.parse_args()
     start_time = time.perf_counter()
     device = choose_device()
@@ -460,6 +506,7 @@ def main():
 
     tmp_ranks = args.output + ".ranks.txt"
 
+    print(f"Generating ranks using {args.model_id}...")
     seed_text, rank_freq = run_sequence_eval_streaming(
         text=text,
         tok=tok,
@@ -467,60 +514,53 @@ def main():
         tmp_ranks_path=tmp_ranks,
         seed_words=args.seed_words,
     )
+    print(f"Ranks generation complete. Found {len(rank_freq)} unique ranks.")
 
-    # if not args.huffman_encoding:
-    #     print(f"Ranks written to {tmp_ranks}")
-    #     return
-
-    # # Build Huffman codebook
-    # codebook = build_huffman_codebook(rank_freq)
-
-    # # Build final output file
-    # write_combined_huffman_file(
-    #     seed_text=seed_text,
-    #     codebook=codebook,
-    #     ranks_file=tmp_ranks,
-    #     output_bin=args.output,
-    # )
-
-    # if not args.keep_intermediate:
-    #     os.remove(tmp_ranks)
-    # end_time = time.perf_counter()
-    # print(f"Huffman-encoded combined file saved to {args.output}")
-    # print(f"Total runtime: {end_time - start_time:.2f} seconds")
-
-    if not args.huffman_encoding and not args.arith_encoding:
-        print(f"Ranks written to {tmp_ranks}")
+    # 1. No encoding selected
+    if not args.huffman_encoding and not args.arith_encoding and not args.ans_encoding:
+        print(f"No encoding flag set. Raw ranks written to {tmp_ranks}")
         return
 
-    # Don't allow both at once
-    if args.huffman_encoding and args.arith_encoding:
-        raise ValueError("Choose only one of --huffman-encoding or --arith-encoding")
+    # 2. Prevent multiple encodings
+    active_encodings = [args.huffman_encoding, args.arith_encoding, args.ans_encoding]
+    if sum(active_encodings) > 1:
+        raise ValueError("Choose only one of --huffman-encoding, --arith-encoding, or --ans-encoding")
 
+    # 3. Apply selected encoding
+    scheme = "Unknown"
+    
     if args.huffman_encoding:
-        # Build Huffman codebook
+        scheme = "Huffman"
         codebook = build_huffman_codebook(rank_freq)
-
-        # Build final output file (Huffman)
         write_combined_huffman_file(
             seed_text=seed_text,
             codebook=codebook,
             ranks_file=tmp_ranks,
             output_bin=args.output,
         )
-        scheme = "Huffman"
-    else:
-        # Arithmetic coding path
+        
+    elif args.arith_encoding:
+        scheme = "Arithmetic"
         write_combined_arithmetic_file(
             seed_text=seed_text,
             rank_freq=rank_freq,
             ranks_file=tmp_ranks,
             output_bin=args.output,
         )
-        scheme = "arithmetic"
+        
+    elif args.ans_encoding:
+        scheme = "rANS"
+        write_combined_ans_file(
+            seed_text=seed_text,
+            rank_freq=rank_freq,
+            ranks_file=tmp_ranks,
+            output_bin=args.output,
+        )
 
+    # 4. Cleanup
     if not args.keep_intermediate:
         os.remove(tmp_ranks)
+    
     end_time = time.perf_counter()
     print(f"{scheme} encoded combined file saved to {args.output}")
     print(f"Total runtime: {end_time - start_time:.2f} seconds")
