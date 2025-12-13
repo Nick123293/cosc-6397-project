@@ -280,68 +280,205 @@ def decode_from_ranks_streaming(
     model_id: str,
     device=None,
     dtype=None,
+    summary_json=None,
 ):
-    device = device or choose_device()
-    dtype = dtype or choose_dtype(device)
+    """
+    Decoder that mirrors the compressor logic in run_sequence_eval_streaming.
 
-    tok, model = load_model_and_tokenizer(model_id, device, dtype)
-    
-    # Detect max context
+    Policy:
+      - Let L0 = number of seed tokens.
+      - Let T_total = L0 + len(ranks) be the final decoded length.
+      - If T_total <= max_ctx:
+          Use KV-cache incremental decoding over the full prefix.
+      - If T_total > max_ctx:
+          Use strict sliding-window decoding for *all* tokens,
+          recomputing a forward pass at each step with the last
+          <= max_ctx tokens as context (no KV cache).
+
+    This matches the compressor, which does:
+      - KV-cache walk if the *full* sequence fits in context.
+      - Otherwise, sliding-window forward passes for every position.
+    """
+    import torch
+    from transformers import AutoTokenizer, AutoModelForCausalLM
+    import json
+
+    # ---------------------------
+    # Device / dtype defaults
+    # ---------------------------
+    if device is None:
+        if torch.cuda.is_available():
+            device = torch.device("cuda")
+        elif torch.backends.mps.is_available():
+            device = torch.device("mps")
+        else:
+            device = torch.device("cpu")
+
+    if dtype is None:
+        if device.type in ["cuda", "mps"]:
+            dtype = torch.float16
+        else:
+            dtype = torch.float32
+
+    # ---------------------------
+    # Load tokenizer / model
+    # ---------------------------
+    tok = AutoTokenizer.from_pretrained(model_id)
+    model = AutoModelForCausalLM.from_pretrained(model_id, dtype=dtype)
+    model.to(device)
+    model.eval()
+
+    # ---------------------------
+    # Determine max context length
+    # ---------------------------
     cfg = getattr(model, "config", None)
-    max_ctx = getattr(cfg, "max_position_embeddings", 2048) if cfg else 2048
+    max_ctx = None
+    if cfg is not None:
+        max_ctx = getattr(cfg, "n_positions", None)
+        if max_ctx is None:
+            max_ctx = getattr(cfg, "max_position_embeddings", None)
+    if max_ctx is None:
+        max_ctx = 1024  # safe default (must match compressor's fallback)
 
-    seed_ids = tok(seed_text, return_tensors="pt").input_ids.to(device)
+    # ---------------------------
+    # Tokenize seed and init state
+    # ---------------------------
+    seed_ids = tok(seed_text, return_tensors="pt")["input_ids"].to(device)
     decoded_ids = seed_ids[0].tolist()
 
-    with torch.inference_mode():
-        # Prefill with seed
-        outputs = model(seed_ids, use_cache=True)
-        past_key_values = outputs.past_key_values
-        last_token_id = decoded_ids[-1]
-        
-        step_ids = torch.empty(1, 1, dtype=torch.long, device=device)
+    L0 = len(seed_ids[0])
+    T_total = L0 + len(ranks)
 
-        with open(output_file, "w", encoding="utf-8") as f_out:
-            f_out.write(seed_text)
-            text_buffer = []
+    # Decide decoding mode to mirror compressor:
+    # If the final sequence fits in context -> KV mode
+    # Otherwise -> pure sliding-window mode (no KV at all)
+    use_kv = T_total <= max_ctx
 
-            for i, rank in enumerate(tqdm(ranks, desc="Reconstructing text")):
-                # Check context length strategy
-                if len(decoded_ids) > max_ctx:
-                    # Fallback to sliding window if context is full (slower but works)
-                    context_tensor = torch.tensor([decoded_ids[-max_ctx:]], device=device)
-                    outputs = model(context_tensor)
-                    last_logits = outputs.logits[0, -1, :]
-                    # Reset cache because we are sliding
-                    past_key_values = None 
-                else:
-                    # Use KV Cache
-                    step_ids[0, 0] = last_token_id
-                    outputs = model(
-                        step_ids,
-                        use_cache=True,
-                        past_key_values=past_key_values,
+    # KV-cache state (used only if use_kv=True)
+    kv_initialized = False
+    past = None
+    logits_for_next = None
+
+    # ---------------------------
+    # Decode and write output
+    # ---------------------------
+    with open(output_file, "w", encoding="utf-8") as f_out:
+        f_out.write(seed_text)
+
+        text_buffer = []
+
+        for rank in ranks:
+            prefix_len = len(decoded_ids)
+
+            if use_kv:
+                # --------------------------------------------------
+                # KV-cache decoding: full-prefix causal context
+                # (Only used when T_total <= max_ctx, so in practice
+                #  prefix_len never exceeds max_ctx.)
+                # --------------------------------------------------
+                if not kv_initialized:
+                    # First step: run model on the entire seed prefix
+                    with torch.inference_mode():
+                        out = model(input_ids=seed_ids, use_cache=True)
+                    past = out.past_key_values
+                    logits_for_next = out.logits[0, -1, :]
+                    kv_initialized = True
+
+                # Convert rank -> token using logits_for_next
+                vocab_size = logits_for_next.shape[-1]
+                if rank < 1 or rank > vocab_size:
+                    raise ValueError(
+                        f"Rank {rank} is out of bounds for vocab size {vocab_size} "
+                        f"(must be between 1 and {vocab_size})"
                     )
-                    past_key_values = outputs.past_key_values
-                    last_logits = outputs.logits[0, -1, :]
+
+                sorted_ids = torch.argsort(logits_for_next, descending=True)
+                next_token_id = int(sorted_ids[rank - 1].item())
+
+                decoded_ids.append(next_token_id)
+
+                token_str = tok.decode(
+                    [next_token_id],
+                    clean_up_tokenization_spaces=False,
+                )
+                text_buffer.append(token_str)
+
+                # Prepare logits for the *next* step
+                next_input = torch.tensor([[next_token_id]], device=device)
+                with torch.inference_mode():
+                    out = model(
+                        input_ids=next_input,
+                        past_key_values=past,
+                        use_cache=True,
+                    )
+                past = out.past_key_values
+                logits_for_next = out.logits[0, -1, :]
+
+            else:
+                # --------------------------------------------------
+                # Pure sliding-window decoding (Option A)
+                # Mirrors compressor's sliding-window path:
+                #   start_idx = max(0, pos - max_ctx)
+                #   context = tokens[start_idx:pos]
+                # --------------------------------------------------
+                start_idx = max(0, prefix_len - max_ctx)
+                ctx_slice = decoded_ids[start_idx:prefix_len]
+
+                context_ids = torch.tensor(
+                    ctx_slice,
+                    dtype=torch.long,
+                    device=device,
+                ).unsqueeze(0)  # (1, <= max_ctx)
+
+                with torch.inference_mode():
+                    out = model(input_ids=context_ids)
+                    last_logits = out.logits[0, -1, :]
+
+                vocab_size = last_logits.shape[-1]
+                if rank < 1 or rank > vocab_size:
+                    raise ValueError(
+                        f"Rank {rank} is out of bounds for vocab size {vocab_size} "
+                        f"(must be between 1 and {vocab_size})"
+                    )
 
                 sorted_ids = torch.argsort(last_logits, descending=True)
                 next_token_id = int(sorted_ids[rank - 1].item())
 
                 decoded_ids.append(next_token_id)
-                last_token_id = next_token_id
 
-                token_str = tok.decode([next_token_id], clean_up_tokenization_spaces=False)
+                token_str = tok.decode(
+                    [next_token_id],
+                    clean_up_tokenization_spaces=False,
+                )
                 text_buffer.append(token_str)
 
-                if len(text_buffer) >= 512:
-                    f_out.write("".join(text_buffer))
-                    text_buffer = []
-
-            if text_buffer:
+            # Periodically flush text to disk
+            if len(text_buffer) >= 1024:
                 f_out.write("".join(text_buffer))
+                text_buffer = []
 
-    return len(decoded_ids)
+        # Final flush
+        if text_buffer:
+            f_out.write("".join(text_buffer))
+
+    total_tokens = len(decoded_ids)
+
+    # Optional summary
+    if summary_json is not None:
+        summary = {
+            "seed_text": seed_text,
+            "num_ranks": len(ranks),
+            "total_tokens": int(total_tokens),
+            "max_ctx": int(max_ctx),
+            "mode": "kv_only" if use_kv else "sliding_window_only",
+            "model_id": model_id,
+            "device": str(device),
+            "dtype": str(dtype),
+        }
+        with open(summary_json, "w", encoding="utf-8") as f_js:
+            json.dump(summary, f_js, indent=2)
+
+    return total_tokens
 
 
 # ============================================================
