@@ -17,7 +17,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 # ---------------------- Config ----------------------
 DEFAULT_MODEL_ID = "meta-llama/Llama-3.2-1B"
 DEFAULT_SEED_WORDS = 5
-FLUSH_EVERY = 1048576   # ranks buffered before writing to tmp file
+# FLUSH_EVERY = 1048576   # ranks buffered before writing to tmp file
 CODE_BITS = 32
 TOP = (1 << CODE_BITS) - 1
 FIRST_QTR = TOP // 4 + 1
@@ -490,11 +490,6 @@ def run_sequence_eval_streaming(text, tok, model, tmp_ranks_path, seed_words):
                     rank_freq[rk] += 1
                     buffer.append(rk)
 
-                    if len(buffer) >= FLUSH_EVERY:
-                        for r in buffer:
-                            f.write(f"{r}\n")
-                        buffer.clear()
-
                     # Prepare logits for the next position (pos+1) by
                     # feeding in the *true* token at `pos`.
                     if pos + 1 < T:
@@ -541,11 +536,6 @@ def run_sequence_eval_streaming(text, tok, model, tmp_ranks_path, seed_words):
 
                 rank_freq[rk] += 1
                 buffer.append(rk)
-
-                if len(buffer) >= FLUSH_EVERY:
-                    for r in buffer:
-                        f.write(f"{r}\n")
-                    buffer.clear()
 
         # Final flush
         for r in buffer:
