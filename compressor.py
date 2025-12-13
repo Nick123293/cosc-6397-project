@@ -410,16 +410,17 @@ def token_rank(prob_vector, true_token_id):
 
 def run_sequence_eval_streaming(text, tok, model, tmp_ranks_path, seed_words):
     """
-    Compute ranks for the given text using a sliding-window evaluation
-    that respects the model's maximum context length (e.g., 1024 for GPT-2).
+    Compute ranks for the given text.
 
-    For each position pos >= L0 (where L0 is the number of seed tokens),
-    we:
-      - take up to `max_ctx` previous tokens as context,
-      - run a single forward pass over that window,
-      - use the last logits to compute the rank of the true token at `pos`.
+    If the total length T of the tokenized text satisfies T <= max_ctx
+    (i.e., the model can attend to the entire prefix without truncation),
+    we use a KV-cache-based left-to-right evaluation, which is O(T)
+    forward calls and reuses the cached keys/values.
 
-    Ranks are written to tmp_ranks_path, with the first line = seed_text.
+    Otherwise, we fall back to a sliding-window evaluation that respects
+    the model's maximum context length by taking the last `max_ctx` tokens
+    as context for each position and running a fresh forward pass.
+    This matches the original semantics.
     """
 
     device = model.device
@@ -434,7 +435,7 @@ def run_sequence_eval_streaming(text, tok, model, tmp_ranks_path, seed_words):
     seed_ids = tok(seed_text, return_tensors="pt")["input_ids"].to(device)
     L0 = seed_ids.shape[1]
 
-    # Determine maximum context length from model config (GPT-2: n_positions = 1024)
+    # Determine maximum context length from model config
     cfg = getattr(model, "config", None)
     max_ctx = None
     if cfg is not None:
@@ -442,7 +443,7 @@ def run_sequence_eval_streaming(text, tok, model, tmp_ranks_path, seed_words):
         if max_ctx is None:
             max_ctx = getattr(cfg, "max_position_embeddings", None)
     if max_ctx is None:
-        max_ctx = 1024  # safe default for GPT-2-class models
+        max_ctx = 1024  # safe default
 
     rank_freq = defaultdict(int)
     buffer = []
@@ -451,48 +452,107 @@ def run_sequence_eval_streaming(text, tok, model, tmp_ranks_path, seed_words):
         # First line is the seed text (metadata used by your encoders)
         f.write(seed_text + "\n")
 
-        # For each target position pos (token we want to score)
-        for pos in range(L0, T):
-            true_id = int(full_ids[0, pos])
-
-            # Take up to max_ctx previous tokens as context
-            # (pos is the index of the token to predict)
-            start_idx = max(0, pos - max_ctx)
-            context_ids = full_ids[:, start_idx:pos]  # shape (1, <=max_ctx)
-
-            if context_ids.shape[1] == 0:
-                # Degenerate case: extremely short text
-                # Use the first token as context to avoid empty input.
-                context_ids = full_ids[:, 0:1]
-
+        # ---------------------------------------------------------
+        # Case 1: Entire sequence fits into model context
+        #         → use KV cache, left-to-right.
+        #
+        # For each pos in [L0, T-1], we want logits that predict token
+        # at index `pos` given tokens [0..pos-1]. With a causal model:
+        #
+        #   - Run model on prefix [0..L0-1] with use_cache=True.
+        #   - The logits for predicting token L0 are out.logits[:, -1, :].
+        #   - Then, for pos = L0..T-1:
+        #       - compute rank from current logits (predicting pos),
+        #       - feed the true token at `pos` back in with past_key_values
+        #         to get logits for `pos+1`, etc.
+        # ---------------------------------------------------------
+        if T <= max_ctx:
             with torch.inference_mode():
-                # No persistent KV cache: we run one forward per window.
-                # For a 1024-token window this is typically fast and GPU-friendly.
-                out = model(input_ids=context_ids)
-                logits = out.logits[0, -1, :]  # prediction for the "next token"
+                # Initial prefix: tokens before the first position we score (pos = L0)
+                prefix = full_ids[:, :L0]  # shape (1, L0)
+                out = model(input_ids=prefix, use_cache=True)
+                past = out.past_key_values
 
-                # Rank = 1-based index of true_id in argsort(logits, descending=True)
-                sorted_ids = torch.argsort(logits, descending=True)
-                true_pos = (sorted_ids == true_id).nonzero(as_tuple=False)
-                if true_pos.numel() == 0:
-                    raise RuntimeError(
-                        "True token id not found in sorted_ids (should never happen)"
-                    )
-                rk = int(true_pos.item()) + 1
+                # We will use out.logits from each step as the prediction
+                # for the current `pos`, then advance using the true token.
+                for pos in range(L0, T):
+                    true_id = int(full_ids[0, pos])
 
-            rank_freq[rk] += 1
-            buffer.append(rk)
+                    logits = out.logits[0, -1, :]  # prediction for token at `pos`
+                    sorted_ids = torch.argsort(logits, descending=True)
+                    true_pos = (sorted_ids == true_id).nonzero(as_tuple=False)
+                    if true_pos.numel() == 0:
+                        raise RuntimeError(
+                            "True token id not found in sorted_ids (should never happen)"
+                        )
+                    rk = int(true_pos.item()) + 1
 
-            if len(buffer) >= FLUSH_EVERY:
-                for r in buffer:
-                    f.write(f"{r}\n")
-                buffer.clear()
+                    rank_freq[rk] += 1
+                    buffer.append(rk)
+
+                    if len(buffer) >= FLUSH_EVERY:
+                        for r in buffer:
+                            f.write(f"{r}\n")
+                        buffer.clear()
+
+                    # Prepare logits for the next position (pos+1) by
+                    # feeding in the *true* token at `pos`.
+                    if pos + 1 < T:
+                        next_input = full_ids[:, pos:pos+1]  # shape (1, 1)
+                        out = model(
+                            input_ids=next_input,
+                            past_key_values=past,
+                            use_cache=True,
+                        )
+                        past = out.past_key_values
+
+        # ---------------------------------------------------------
+        # Case 2: Sequence exceeds context length
+        #         → fall back to original sliding-window logic.
+        # ---------------------------------------------------------
+        else:
+            for pos in range(L0, T):
+                true_id = int(full_ids[0, pos])
+
+                # Take up to max_ctx previous tokens as context
+                # (pos is the index of the token to predict)
+                start_idx = max(0, pos - max_ctx)
+                context_ids = full_ids[:, start_idx:pos]  # shape (1, <=max_ctx)
+
+                if context_ids.shape[1] == 0:
+                    # Degenerate case: extremely short text
+                    # Use the first token as context to avoid empty input.
+                    context_ids = full_ids[:, 0:1]
+
+                with torch.inference_mode():
+                    # No persistent KV cache: one forward per window,
+                    # exactly as in the original implementation.
+                    out = model(input_ids=context_ids)
+                    logits = out.logits[0, -1, :]  # prediction for the "next token"
+
+                    # Rank = 1-based index of true_id in argsort(logits, descending=True)
+                    sorted_ids = torch.argsort(logits, descending=True)
+                    true_pos = (sorted_ids == true_id).nonzero(as_tuple=False)
+                    if true_pos.numel() == 0:
+                        raise RuntimeError(
+                            "True token id not found in sorted_ids (should never happen)"
+                        )
+                    rk = int(true_pos.item()) + 1
+
+                rank_freq[rk] += 1
+                buffer.append(rk)
+
+                if len(buffer) >= FLUSH_EVERY:
+                    for r in buffer:
+                        f.write(f"{r}\n")
+                    buffer.clear()
 
         # Final flush
         for r in buffer:
             f.write(f"{r}\n")
 
     return seed_text, rank_freq
+
 
 
 # ============================================================
