@@ -64,6 +64,39 @@ def read_bits_from_bytes(data: bytes) -> str:
 
 
 # ============================================================
+# ---------------------- ZSTD ON RANKS -----------------------
+# ============================================================
+def decode_zstd_rank_file(path: str):
+    """
+    Reads [Seed Length][Seed][Zstd Compressed Ranks]
+    Decompresses ranks and returns (seed_text, list_of_ranks).
+    """
+    with open(path, "rb") as f:
+        data = f.read()
+
+    idx = 0
+    # 1. Read Seed
+    seed_len = struct.unpack_from(">I", data, idx)[0]
+    idx += 4
+    seed_text = data[idx:idx + seed_len].decode("utf-8")
+    idx += seed_len
+    
+    # 2. Decompress the rest
+    compressed_ranks = data[idx:]
+    dctx = zstd.ZstdDecompressor()
+    ranks_text_bytes = dctx.decompress(compressed_ranks)
+    
+    # 3. Parse ranks
+    ranks_text = ranks_text_bytes.decode('utf-8')
+    ranks = []
+    for line in ranks_text.splitlines():
+        if line.strip():
+            ranks.append(int(line.strip()))
+            
+    return seed_text, ranks
+
+
+# ============================================================
 # ---------------------- Huffman Decoding --------------------
 # ============================================================
 def decode_huffman_file(path: str):
@@ -344,30 +377,11 @@ def main():
     parser.add_argument(
         "--zstd",
         action="store_true",
-        help="Decompress a Zstandard file.",
+        help="Treat input_file as a Zstd-compressed RANKS file.",
     )
     
     args = parser.parse_args()
 
-    # --- MODE 1: ZSTANDARD DECOMPRESSION ---
-    if args.zstd:
-        print(f"--- Zstandard Decompression ---")
-        try:
-            start_t = time.perf_counter()
-            dctx = zstd.ZstdDecompressor()
-            with open(args.input_file, 'rb') as f:
-                compressed_data = f.read()
-            decompressed_data = dctx.decompress(compressed_data)
-            with open(args.output_file, 'wb') as f:
-                f.write(decompressed_data)
-            end_t = time.perf_counter()
-            print(f"Decompressed to: {args.output_file}")
-            print(f"Runtime: {end_t - start_t:.4f} sec")
-        except Exception as e:
-            print(f"Error: {e}")
-        return
-
-    # --- MODE 2: LLM DECOMPRESSION ---
     start_time = time.perf_counter()
 
     device = choose_device()
@@ -380,6 +394,9 @@ def main():
     elif args.arithmetic_binary:
         print(f"Decoding Arithmetic binary: {args.input_file}")
         seed_text, ranks = decode_arithmetic_file(args.input_file)
+    elif args.zstd:
+        print(f"Decoding Zstandard ranks: {args.input_file}")
+        seed_text, ranks = decode_zstd_rank_file(args.input_file)
     else:
         print(f"Reading ranks text file: {args.input_file}")
         seed_text, ranks = read_input_file(args.input_file)

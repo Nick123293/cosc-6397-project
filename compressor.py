@@ -316,6 +316,36 @@ def write_combined_arithmetic_file(
         bf.write(data_bytes)
 
 # ============================================================
+# ---------------------- ZSTD ON RANKS -----------------------
+# ============================================================
+def write_combined_zstd_rank_file(
+    seed_text: str,
+    ranks_file: str,
+    output_bin: str
+):
+    """
+    Compresses the RANKS (not the original text) using Zstandard.
+    Format: [Seed Length] [Seed Text] [Zstd Compressed Ranks Data]
+    """
+    # 1. Read the ranks file text (it's already a list of numbers in text format)
+    #    We skip the first line (seed text) because we store it separately.
+    with open(ranks_file, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+        # lines[0] is seed text
+        ranks_text = "".join(lines[1:]) # Join all ranks into one big string
+    
+    # 2. Compress the ranks string
+    cctx = zstd.ZstdCompressor(level=3)
+    compressed_data = cctx.compress(ranks_text.encode('utf-8'))
+    
+    # 3. Write binary file
+    with open(output_bin, "wb") as bf:
+        seed_bytes = seed_text.encode("utf-8")
+        bf.write(struct.pack(">I", len(seed_bytes)))
+        bf.write(seed_bytes)
+        bf.write(compressed_data)
+
+# ============================================================
 # ---------------------- MODEL UTILS -------------------------
 # ============================================================
 
@@ -431,46 +461,15 @@ def main():
     parser.add_argument("--huffman-encoding", action="store_true", help="Use Huffman encoding")
     parser.add_argument("--arith-encoding", action="store_true", help="Use Arithmetic encoding")
     parser.add_argument("--ans-encoding", action="store_true", help="Use rANS encoding")
-    parser.add_argument("--zstd-encoding", action="store_true", help="Use Zstandard Baseline (Fast, No LLM)") 
+    parser.add_argument("--zstd-encoding", action="store_true", help="Use Zstandard on RANKS (LLM-based)") 
     parser.add_argument("--keep-intermediate", action="store_true", help="Keep the intermediate .ranks.txt file")
     
     args = parser.parse_args()
     
     # ---------------------------------------------------------
-    # NEW: Zstandard Standalone Mode (Run & Exit)
+    # Info: Zstandard Baseline on Raw Text (for reference)
     # ---------------------------------------------------------
-    if args.zstd_encoding:
-        print(f"\n--- Zstandard Compression (Baseline) ---")
-        try:
-            cctx = zstd.ZstdCompressor(level=3)
-            with open(args.input, 'rb') as f:
-                raw_data = f.read()
-            
-            start_t = time.perf_counter()
-            compressed_data = cctx.compress(raw_data)
-            end_t = time.perf_counter()
-            
-            with open(args.output, 'wb') as f:
-                f.write(compressed_data)
-                
-            orig_size = len(raw_data)
-            zstd_size = len(compressed_data)
-            print(f"Original Size:   {orig_size} bytes")
-            print(f"Compressed Size: {zstd_size} bytes")
-            print(f"Ratio:           {orig_size/zstd_size:.2f}x")
-            print(f"Time:            {end_t - start_t:.4f} sec")
-            print(f"Saved to:        {args.output}")
-            print("----------------------------------------\n")
-        except Exception as e:
-            print(f"Error running Zstandard: {e}")
-        # Exit immediately so we don't load the LLM
-        return
-    # ---------------------------------------------------------
-
-    # ---------------------------------------------------------
-    # EXISTING: Zstandard Baseline PRINT (Keep as requested)
-    # ---------------------------------------------------------
-    print(f"\n--- Calculating Zstandard Baseline for {args.input} ---")
+    print(f"\n--- Calculating Zstandard Baseline (Raw Text) ---")
     try:
         cctx = zstd.ZstdCompressor(level=3)
         with open(args.input, 'rb') as f:
@@ -481,7 +480,7 @@ def main():
         zstd_size = len(compressed_data)
         
         print(f"Original Text Size: {orig_size} bytes")
-        print(f"Zstandard Size:     {zstd_size} bytes")
+        print(f"Zstandard (Raw):    {zstd_size} bytes")
         if zstd_size > 0:
             print(f"Baseline Ratio:     {orig_size / zstd_size:.2f}")
     except Exception as e:
@@ -512,14 +511,14 @@ def main():
     print(f"Ranks generation complete. Found {len(rank_freq)} unique ranks.")
 
     # 1. No encoding selected
-    if not args.huffman_encoding and not args.arith_encoding and not args.ans_encoding:
+    if not args.huffman_encoding and not args.arith_encoding and not args.ans_encoding and not args.zstd_encoding:
         print(f"No encoding flag set. Raw ranks written to {tmp_ranks}")
         return
 
     # 2. Prevent multiple encodings
-    active_encodings = [args.huffman_encoding, args.arith_encoding, args.ans_encoding]
+    active_encodings = [args.huffman_encoding, args.arith_encoding, args.ans_encoding, args.zstd_encoding]
     if sum(active_encodings) > 1:
-        raise ValueError("Choose only one of --huffman-encoding, --arith-encoding, or --ans-encoding")
+        raise ValueError("Choose only one encoding method.")
 
     # 3. Apply selected encoding
     scheme = "Unknown"
@@ -548,6 +547,14 @@ def main():
         write_combined_ans_file(
             seed_text=seed_text,
             rank_freq=rank_freq,
+            ranks_file=tmp_ranks,
+            output_bin=args.output,
+        )
+
+    elif args.zstd_encoding:
+        scheme = "Zstandard (Ranks)"
+        write_combined_zstd_rank_file(
+            seed_text=seed_text,
             ranks_file=tmp_ranks,
             output_bin=args.output,
         )
