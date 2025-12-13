@@ -379,13 +379,13 @@ def run_sequence_eval_streaming(text, tok, model, tmp_ranks_path, seed_words):
     device = model.device
 
     # Full tokenization
-    full = tok(text, return_tensors="pt")
+    full = tok(text, return_tensors="pt", add_special_tokens=False)
     full_ids = full["input_ids"].to(device)
     T = full_ids.shape[1]
 
     # Seed
     seed_text = first_n_words_slice(text, seed_words)
-    seed_ids = tok(seed_text, return_tensors="pt")["input_ids"].to(device)
+    seed_ids = tok(seed_text, return_tensors="pt", add_special_tokens=False)["input_ids"].to(device)
     L0 = seed_ids.shape[1]
 
     # Config Check

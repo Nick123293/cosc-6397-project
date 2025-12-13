@@ -376,61 +376,130 @@ def decode_from_ranks_streaming(
     device=None,
     dtype=None,
 ):
+    """
+    Inverse of run_sequence_eval_streaming.
+
+    Given:
+      - seed_text: the same seed prefix used at compression time
+      - ranks: list of 1-based ranks for each subsequent token
+      - model_id: HF model name (must match compressor)
+    Reconstructs the token sequence and writes decoded text to output_file.
+    """
     device = device or choose_device()
     dtype = dtype or choose_dtype(device)
 
     tok, model = load_model_and_tokenizer(model_id, device, dtype)
-    
-    cfg = getattr(model, "config", None)
-    max_ctx = getattr(cfg, "max_position_embeddings", 2048) if cfg else 2048
 
-    seed_ids = tok(seed_text, return_tensors="pt").input_ids.to(device)
+    # Config / context length
+    cfg = getattr(model, "config", None)
+    max_ctx = getattr(cfg, "max_position_embeddings", 1024) or 1024
+
+    # Seed tokens
+    seed_ids = tok(seed_text, return_tensors="pt", add_special_tokens=False)["input_ids"].to(device)
+    L0 = seed_ids.shape[1]
+
+    num_ranks = len(ranks)
+    T = L0 + num_ranks
+
+    # This will hold the full reconstructed token sequence (equivalent to full_ids[0] in compressor)
     decoded_ids = seed_ids[0].tolist()
 
-    with torch.inference_mode():
-        outputs = model(seed_ids, use_cache=True)
-        past_key_values = outputs.past_key_values
-        last_token_id = decoded_ids[-1]
-        
-        step_ids = torch.empty(1, 1, dtype=torch.long, device=device)
+    # -----------------------------
+    # Case 1: Fits in context (KV cache)
+    # Mirrors compressor's: Case 1: Fits in Context (KV Cache)
+    # -----------------------------
+    if T <= max_ctx:
+        with torch.inference_mode():
+            # Match compressor:
+            #   prefix = full_ids[:, :L0]
+            #   out = model(input_ids=prefix, use_cache=True)
+            #   past = out.past_key_values
+            out = model(input_ids=seed_ids, use_cache=True)
+            past = out.past_key_values
 
-        with open(output_file, "w", encoding="utf-8") as f_out:
-            f_out.write(seed_text)
-            text_buffer = []
+            for i, rank in enumerate(
+                tqdm(ranks, desc="Reconstructing (KV cache)", unit="token")
+            ):
+                # Compressor uses out.logits[0, -1, :] for token at position pos = L0 + i
+                logits = out.logits[0, -1, :]
+                sorted_ids = torch.argsort(logits, descending=True)
 
-            for i, rank in enumerate(tqdm(ranks, desc="Reconstructing text")):
-                if len(decoded_ids) > max_ctx:
-                    context_tensor = torch.tensor([decoded_ids[-max_ctx:]], device=device)
-                    outputs = model(context_tensor)
-                    last_logits = outputs.logits[0, -1, :]
-                    past_key_values = None 
-                else:
-                    step_ids[0, 0] = last_token_id
-                    outputs = model(
-                        step_ids,
-                        use_cache=True,
-                        past_key_values=past_key_values,
+                if rank < 1 or rank > sorted_ids.numel():
+                    raise ValueError(
+                        f"Invalid rank {rank} at step {i} (vocab size={sorted_ids.numel()})"
                     )
-                    past_key_values = outputs.past_key_values
-                    last_logits = outputs.logits[0, -1, :]
 
-                sorted_ids = torch.argsort(last_logits, descending=True)
                 next_token_id = int(sorted_ids[rank - 1].item())
-
                 decoded_ids.append(next_token_id)
-                last_token_id = next_token_id
 
-                token_str = tok.decode([next_token_id], clean_up_tokenization_spaces=False)
-                text_buffer.append(token_str)
+                # Mirror compressor:
+                #   if pos + 1 < T:
+                #       next_input = full_ids[:, pos:pos+1]
+                #       out = model(input_ids=next_input, past_key_values=past, use_cache=True)
+                #       past = out.past_key_values
+                if i + 1 < num_ranks:
+                    next_input = torch.tensor(
+                        [[next_token_id]], dtype=torch.long, device=device
+                    )
+                    out = model(
+                        input_ids=next_input,
+                        past_key_values=past,
+                        use_cache=True,
+                    )
+                    past = out.past_key_values
 
-                if len(text_buffer) >= 512:
-                    f_out.write("".join(text_buffer))
-                    text_buffer = []
+    # -----------------------------
+    # Case 2: Exceeds context (Sliding window)
+    # Mirrors compressor's: Case 2: Exceeds Context (Sliding Window)
+    # -----------------------------
+    else:
+        with torch.inference_mode():
+            for i, rank in enumerate(
+                tqdm(ranks, desc="Reconstructing (sliding window)", unit="token")
+            ):
+                # Position in the full sequence (same pos as in compressor loop)
+                pos = L0 + i
 
-            if text_buffer:
-                f_out.write("".join(text_buffer))
+                # Compressor:
+                #   start_idx = max(0, pos - max_ctx)
+                #   context_ids = full_ids[:, start_idx:pos]
+                #   if context_ids.shape[1] == 0: context_ids = full_ids[:, 0:1]
+                start_idx = max(0, pos - max_ctx)
+                context_slice = decoded_ids[start_idx:pos]
+
+                if len(context_slice) == 0:
+                    # Fallback exactly like compressor: first token only
+                    context_slice = decoded_ids[0:1]
+
+                context_ids = torch.tensor(
+                    [context_slice], dtype=torch.long, device=device
+                )
+
+                out = model(input_ids=context_ids)
+                logits = out.logits[0, -1, :]
+                sorted_ids = torch.argsort(logits, descending=True)
+
+                if rank < 1 or rank > sorted_ids.numel():
+                    raise ValueError(
+                        f"Invalid rank {rank} at step {i} (vocab size={sorted_ids.numel()})"
+                    )
+
+                next_token_id = int(sorted_ids[rank - 1].item())
+                decoded_ids.append(next_token_id)
+
+    # -----------------------------
+    # Decode full token sequence to text
+    # -----------------------------
+    full_text = tok.decode(
+        decoded_ids,
+        clean_up_tokenization_spaces=False,
+    )
+
+    with open(output_file, "w", encoding="utf-8") as f_out:
+        f_out.write(full_text)
 
     return len(decoded_ids)
+
 
 
 # ============================================================
