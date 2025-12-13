@@ -11,6 +11,7 @@ import time
 import collections # Re-added for explicit usage if needed, though defaultdict covers most
 
 import torch
+import zstandard as zstd  # <--- ADDED THIS IMPORT
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 
@@ -561,6 +562,31 @@ def main():
     parser.add_argument("--keep-intermediate", action="store_true", help="Keep the intermediate .ranks.txt file")
     
     args = parser.parse_args()
+
+    # ---------------------------------------------------------
+    # NEW: Run Zstandard Baseline Calculation immediately
+    # ---------------------------------------------------------
+    print(f"\n--- Calculating Zstandard Baseline for {args.input} ---")
+    try:
+        cctx = zstd.ZstdCompressor(level=3)
+        # We use the raw bytes of the file for fair comparison
+        with open(args.input, 'rb') as f:
+            raw_data = f.read()
+            compressed_data = cctx.compress(raw_data)
+        
+        orig_size = len(raw_data)
+        zstd_size = len(compressed_data)
+        
+        print(f"Original Text Size: {orig_size} bytes")
+        print(f"Zstandard Size:     {zstd_size} bytes")
+        if zstd_size > 0:
+            print(f"Baseline Ratio:     {orig_size / zstd_size:.2f}")
+    except Exception as e:
+        print(f"Warning: Could not run Zstandard check. Error: {e}")
+        print("Make sure you installed it: pip install zstandard")
+    print("---------------------------------------------------------\n")
+    # ---------------------------------------------------------
+
     start_time = time.perf_counter()
     device = choose_device()
     dtype = choose_dtype(device)
