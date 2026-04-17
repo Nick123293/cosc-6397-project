@@ -2,7 +2,7 @@
 import sys
 import os
 
-MAX_BYTES = 1024 * 512        # 1 MiB strict cutoff
+MAX_BYTES = 1024 * 128        # 1 MiB strict cutoff
 EXTRA_BYTES = 200              # read ahead to find a clean word boundary
 
 def truncate_full_word_after_limit(path):
